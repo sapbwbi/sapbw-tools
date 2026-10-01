@@ -1,0 +1,204 @@
+&---------------------------------------------------------------------
+*& Report Z_ADSO_DELETE_ZERO_ROWS
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT Z_ADSO_DELETE_ZERO_ROWS.
+
+PARAMETERS:
+  p_adso TYPE rsdodsobject DEFAULT 'TEST001' OBLIGATORY,
+  p_del  AS CHECKBOX DEFAULT space.
+
+DATA:
+  lv_direct_update TYPE rsoadso-direct_update,
+  lv_table         TYPE tabname,
+  lv_tabclass      TYPE dd02l-tabclass,
+  lv_count         TYPE int8,
+  lv_deleted       TYPE int8,
+  lv_answer        TYPE c LENGTH 1,
+  lv_question      TYPE string,
+  lt_fields        TYPE STANDARD TABLE OF dfies WITH EMPTY KEY,
+  lt_conditions    TYPE STANDARD TABLE OF string WITH EMPTY KEY,
+  lv_where         TYPE string.
+
+START-OF-SELECTION.
+
+  " Do not allow execution in background mode.
+  IF sy-batch = abap_true.
+    MESSAGE 'Background execution is not allowed'
+      TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  TRANSLATE p_adso TO UPPER CASE.
+
+  " Allow processing only for an active direct-update aDSO.
+  SELECT SINGLE direct_update
+    FROM rsoadso
+    WHERE adsonm  = @p_adso
+      AND objvers = 'A'
+    INTO @lv_direct_update.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Active aDSO metadata not found'
+      TYPE 'E'.
+  ENDIF.
+
+  IF lv_direct_update <> abap_true.
+    MESSAGE 'Only direct-update aDSOs are allowed'
+      TYPE 'E'.
+  ENDIF.
+
+  " Resolve generated tables using the full aDSO technical name.
+  TRY.
+      DATA(lt_tables) = cl_rso_adso=>get_tablnm( p_adso ).
+
+    CATCH cx_rs_not_found INTO DATA(lx_not_found).
+      MESSAGE lx_not_found->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+  " Select the active-data table.
+  READ TABLE lt_tables
+    ASSIGNING FIELD-SYMBOL(<ls_table>)
+    WITH KEY dsotabtype = cl_rsdso_dsotable=>c_tabtype_at.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Active-data table not found for the specified aDSO'
+      TYPE 'E'.
+  ENDIF.
+
+  lv_table = <ls_table>-name.
+
+  IF lv_table IS INITIAL.
+    MESSAGE 'Resolved active-data table name is empty'
+      TYPE 'E'.
+  ENDIF.
+
+  " Verify that the resolved DDIC object is a transparent table.
+  SELECT SINGLE tabclass
+    FROM dd02l
+    WHERE tabname  = @lv_table
+      AND as4local = 'A'
+      AND as4vers  = '0000'
+    INTO @lv_tabclass.
+
+  IF sy-subrc <> 0 OR lv_tabclass <> 'TRANSP'.
+    MESSAGE 'Resolved object is not an active transparent table'
+      TYPE 'E'.
+  ENDIF.
+
+  " Read the physical table fields from DDIC.
+  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+    EXPORTING
+      tabname   = lv_table
+    TABLES
+      dfies_tab = lt_fields
+    EXCEPTIONS
+      not_found      = 1
+      internal_error = 2
+      OTHERS         = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Could not read table fields from DDIC'
+      TYPE 'E'.
+  ENDIF.
+
+  " Check every Key Figure (numeric) field.
+  LOOP AT lt_fields INTO DATA(ls_field)
+    WHERE datatype = 'CURR'
+       OR datatype = 'DEC'
+       OR datatype = 'QUAN'
+       OR datatype = 'FLTP'
+       OR datatype = 'INT4'.
+
+    APPEND |{ ls_field-fieldname } = 0| TO lt_conditions.
+  ENDLOOP.
+
+  " Never execute a deletion with an empty condition.
+  IF lt_conditions IS INITIAL.
+    MESSAGE 'No Key Figure  fields found'
+      TYPE 'E'.
+  ENDIF.
+
+  lv_where = concat_lines_of(
+    table = lt_conditions
+    sep   =  AND 
+  ).
+
+  TRY.
+      SELECT COUNT( * )
+        FROM (lv_table)
+        WHERE (lv_where)
+        INTO @lv_count.
+
+      WRITE:
+        / 'aDSO:', p_adso,
+        / 'Direct update:', lv_direct_update,
+        / 'Active-data table:', lv_table,
+        / 'Checked numeric fields:', lines( lt_conditions ),
+        / 'All-zero records:', lv_count.
+
+      IF p_del = abap_false.
+        WRITE: / 'Test run: no records deleted.'.
+        RETURN.
+      ENDIF.
+
+      IF lv_count = 0.
+        WRITE: / 'No records to delete.'.
+        RETURN.
+      ENDIF.
+
+      " Require explicit confirmation before physical deletion.
+      CLEAR lv_answer.
+
+      lv_question =
+        |Physically delete { lv_count } all-zero records |
+        && |from aDSO { p_adso } (table { lv_table })? |
+        && |This action cannot be undone by this report.|.
+
+      CALL FUNCTION 'POPUP_TO_CONFIRM'
+        EXPORTING
+          titlebar              = 'Confirm physical deletion'
+          text_question         = lv_question
+          text_button_1         = 'OK'
+          text_button_2         = 'Cancel'
+          default_button        = '2'
+          display_cancel_button = abap_true
+        IMPORTING
+          answer                = lv_answer
+        EXCEPTIONS
+          text_not_found        = 1
+          OTHERS                = 2.
+
+      " Delete only after a successful popup and explicit OK.
+      IF sy-subrc <> 0 OR lv_answer <> '1'.
+        WRITE: / 'Deletion cancelled. No records deleted.'.
+        RETURN.
+      ENDIF.
+
+      " Physical deletion bypasses BW request and planning processing.
+      " Run only after backup and with exclusive maintenance access.
+      DELETE FROM (lv_table)
+        WHERE (lv_where).
+
+      lv_deleted = sy-dbcnt.
+
+      " This check does not replace proper BW/planning locks.
+      IF lv_deleted <> lv_count.
+        ROLLBACK WORK.
+        MESSAGE 'Deleted-row count differs from the pre-check count'
+          TYPE 'E'.
+      ENDIF.
+
+      COMMIT WORK.
+
+      WRITE: / 'Physically deleted records:', lv_deleted.
+
+    CATCH cx_sy_dynamic_osql_error INTO DATA(lx_dynamic_sql).
+      ROLLBACK WORK.
+      MESSAGE lx_dynamic_sql->get_text( ) TYPE 'E'.
+
+    CATCH cx_sy_open_sql_db INTO DATA(lx_database).
+      ROLLBACK WORK.
+      MESSAGE lx_database->get_text( ) TYPE 'E'.
+  ENDTRY.
